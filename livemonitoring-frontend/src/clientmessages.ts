@@ -8,4 +8,15 @@ export type subscribeMemory = {
     enabled: boolean;
 }
 
-export type ClientMessage = subscribeCPU | subscribeMemory;
+export type subscribeDisk = {
+    type: "subscribe-disk";
+    enabled: boolean;
+}
+
+export type subscribeAlert = {
+    type: "subscribe-alert";
+    cpuThreshold?: number;
+    memoryThreshold?: number;
+}
+
+export type ClientMessage = subscribeCPU | subscribeMemory | subscribeDisk | subscribeAlert;

@@ -2,13 +2,21 @@ import http from "http";
 import app from "./app.js";
 import { WebSocketServer, WebSocket } from "ws";
 import {ClientMessage} from "./types/clientmessages.js";
-import {SubscribedMetricsUpdate} from "./types/servermessages.js";
+import {AlertTriggeredMessage, SubscribedMetricsUpdate} from "./types/servermessages.js";
 import si from 'systeminformation';
 
 interface ClientWebSocket extends WebSocket {
     clientId: string;
     isAlive?: boolean;
-    subscribedMetrics: Set<"cpu_usage" | "memory_usage">;
+    subscribedMetrics: Set<"cpu_usage" | "memory_usage" | "disk_usage">;
+    alertThresholds: {
+        cpu?: number;
+        memory?: number;
+    };
+    alertState: {
+        cpuSent: boolean;
+        memorySent: boolean;
+    };
 }
 
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3001;
@@ -34,16 +42,18 @@ const intervalId = setInterval(async () => {
     // Wir wollen si.currentLoad() nicht aufrufen, wenn niemand CPU will.
     let needCpu = false;
     let needMemory = false;
+    let needDisk = false;
 
     for (const client of clientsById.values()) {
         if (client.readyState === WebSocket.OPEN) {
             if (client.subscribedMetrics.has("cpu_usage")) needCpu = true;
             if (client.subscribedMetrics.has("memory_usage")) needMemory = true;
+            if (client.subscribedMetrics.has("disk_usage")) needDisk = true;
         }
     }
 
     // Wenn absolut keine Metriken gewünscht sind -> return
-    if (!needCpu && !needMemory) return;
+    if (!needCpu && !needMemory && !needDisk) return;
 
     try {
         // 3. DATEN ABRUFEN (Nur einmal für alle!)
@@ -51,6 +61,7 @@ const intervalId = setInterval(async () => {
         const query: any = {};
         if (needCpu)    query.currentLoad = 'currentLoad';
         if (needMemory) query.mem = 'active, total, used';
+        if(needDisk) query.fsSize = 'fs, size, used, use';
 
         const data = await si.get(query);
 
@@ -75,6 +86,16 @@ const intervalId = setInterval(async () => {
                 };
             }
 
+            if(client.subscribedMetrics.has("disk_usage") && data.fsSize) {
+
+                payload.disk = data.fsSize.map((disk: any) => ({
+                    name: disk.fs,
+                    used: disk.used,
+                    total: disk.size,
+                    percentage: disk.use
+                }));
+            }
+
             // Nur senden, wenn Payload nicht leer ist
             if (Object.keys(payload).length > 0) {
                 const message: SubscribedMetricsUpdate = {
@@ -83,6 +104,33 @@ const intervalId = setInterval(async () => {
                 };
                 client.send(JSON.stringify(message));
             }
+
+            if (client.alertThresholds.cpu && data.currentLoad) {
+                // Wenn aktueller Wert > Grenzwert
+                if (data.currentLoad.currentLoad > client.alertThresholds.cpu && !client.alertState.cpuSent) {
+                    const alertMsg : AlertTriggeredMessage = {
+                        type: "alert-triggered",
+                        metric: "cpu",
+                        value: data.currentLoad.currentLoad,
+                    };
+                    client.send(JSON.stringify(alertMsg));
+                    client.alertState.cpuSent = true;
+                }
+            }
+
+            // Memory Check (basierend auf Prozent)
+            if (client.alertThresholds.memory && data.mem) {
+                if (((data.mem.active / data.mem.total) * 100) > client.alertThresholds.memory && !client.alertState.memorySent) {
+                    const alertMsg : AlertTriggeredMessage= {
+                        type: "alert-triggered",
+                        metric: "memory",
+                        value: (data.mem.active / data.mem.total) * 100,
+                    };
+                    client.send(JSON.stringify(alertMsg));
+                    client.alertState.memorySent = true;
+                }
+            }
+
         }
 
     } catch (e) {
@@ -107,6 +155,11 @@ wss.on("connection", (socket: ClientWebSocket) => {
     socket.clientId = `c${nextId++}`;
     socket.isAlive = true;
     socket.subscribedMetrics = new Set();
+    socket.alertThresholds = {};
+    socket.alertState = {
+        cpuSent: false,
+        memorySent: false
+    }
     clientsById.set(socket.clientId, socket);
     console.log("connection established to", socket.clientId);
 
@@ -127,6 +180,27 @@ wss.on("connection", (socket: ClientWebSocket) => {
             case "subscribe-memory":
                 if (msg.enabled) socket.subscribedMetrics.add("memory_usage");
                 else socket.subscribedMetrics.delete("memory_usage");
+                break;
+            case "subscribe-disk":
+                if(msg.enabled) socket.subscribedMetrics.add("disk_usage");
+                else socket.subscribedMetrics.delete("disk_usage");
+                break;
+            case "subscribe-alert":
+                if(msg.cpuThreshold)
+                {
+                    if(msg.cpuThreshold === 0) delete socket.alertThresholds.cpu;
+                    else {
+                        socket.alertThresholds.cpu = msg.cpuThreshold;
+                        socket.alertState.cpuSent = false;
+                    }
+                }
+                if(msg.memoryThreshold) {
+                    if(msg.memoryThreshold === 0) delete socket.alertThresholds.memory;
+                    else {
+                        socket.alertThresholds.memory = msg.memoryThreshold;
+                        socket.alertState.memorySent = false;
+                    }
+                }
                 break;
         }
     });
